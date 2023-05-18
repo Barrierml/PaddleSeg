@@ -72,6 +72,7 @@ def set_device(device):
         place = 'mlu'
     else:
         place = 'cpu'
+    place = 'gpu'
     paddle.set_device(place)
     logger.info("Set device: {}".format(place))
 

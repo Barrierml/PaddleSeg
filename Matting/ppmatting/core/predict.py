@@ -33,7 +33,7 @@ def partition_list(arr, m):
     return [arr[i:i + n] for i in range(0, len(arr), n)]
 
 
-def save_result(alpha, path, im_path, trimap=None, fg_estimate=True, fg=None):
+def save_result(alpha, im_path, trimap=None, fg_estimate=True, fg=None):
     """
     Save alpha and rgba.
 
@@ -45,13 +45,6 @@ def save_result(alpha, path, im_path, trimap=None, fg_estimate=True, fg=None):
         fg_estimate (bool, optional): Whether to estimate the foreground, Default: True.
         fg (numpy.ndarray, optional): The foreground, if provided, fg_estimate is invalid. Default: None.
     """
-    dirname = os.path.dirname(path)
-    if not os.path.exists(dirname):
-        os.makedirs(dirname)
-    basename = os.path.basename(path)
-    name = os.path.splitext(basename)[0]
-    alpha_save_path = os.path.join(dirname, name + '_alpha.png')
-    rgba_save_path = os.path.join(dirname, name + '_rgba.png')
 
     # save alpha matte
     if trimap is not None:
@@ -59,21 +52,19 @@ def save_result(alpha, path, im_path, trimap=None, fg_estimate=True, fg=None):
         alpha[trimap == 0] = 0
         alpha[trimap == 255] = 255
     alpha = (alpha).astype('uint8')
-    cv2.imwrite(alpha_save_path, alpha)
 
     # save rgba
-    im = cv2.imread(im_path)
-    if fg is None:
-        if fg_estimate:
-            fg = estimate_foreground_ml(im / 255.0, alpha / 255.0) * 255
-        else:
-            fg = im
+    if isinstance(im_path, str):
+        im = cv2.imread(im_path)
+    else:
+        im = im_path
+    foreground, bbbg = estimate_foreground_ml(im / 255.0, alpha / 255.0, return_background=True)
+    fg = foreground * 255
     fg = fg.astype('uint8')
     alpha = alpha[:, :, np.newaxis]
     rgba = np.concatenate((fg, alpha), axis=-1)
-    cv2.imwrite(rgba_save_path, rgba)
 
-    return fg
+    return rgba, bbbg
 
 
 def reverse_transform(img, trans_info):
@@ -114,6 +105,7 @@ def predict(model,
             image_dir=None,
             trimap_list=None,
             save_dir='output',
+            is_save=False,
             fg_estimate=True):
     """
     predict and visualize the image_list.
@@ -145,6 +137,7 @@ def predict(model,
     infer_cost_averager = TimeAverager()
     postprocess_cost_averager = TimeAverager()
     batch_start = time.time()
+    bg = None
     with paddle.no_grad():
         for i, im_path in enumerate(img_lists[local_rank]):
             preprocess_start = time.time()
@@ -177,15 +170,12 @@ def predict(model,
             if image_dir is not None:
                 im_file = im_path.replace(image_dir, '')
             else:
-                im_file = os.path.basename(im_path)
+                im_file = im_path
             if im_file[0] == '/' or im_file[0] == '\\':
                 im_file = im_file[1:]
 
-            save_path = os.path.join(save_dir, im_file)
-            mkdir(save_path)
-            fg = save_result(
+            fg, bbbg = save_result(
                 alpha,
-                save_path,
                 im_path=im_path,
                 trimap=trimap,
                 fg_estimate=fg_estimate,
@@ -209,4 +199,4 @@ def predict(model,
             preprocess_cost_averager.reset()
             infer_cost_averager.reset()
             postprocess_cost_averager.reset()
-    return alpha, fg
+    return alpha, fg, bbbg

@@ -1,4 +1,4 @@
-# Copyright (c) 2020 PaddlePaddle Authors. All Rights Reserved.
+# Copyright (c) 2021 PaddlePaddle Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,20 +14,17 @@
 
 import os
 import math
+import time
 
 import cv2
 import numpy as np
 import paddle
-
+import paddle.nn.functional as F
 from paddleseg import utils
 from paddleseg.core import infer
-from paddleseg.utils import logger, progbar, visualize
+from paddleseg.utils import logger, progbar, TimeAverager
 
-
-def mkdir(path):
-    sub_dir = os.path.dirname(path)
-    if not os.path.exists(sub_dir):
-        os.makedirs(sub_dir)
+from ppmatting.utils import mkdir, estimate_foreground_ml
 
 
 def partition_list(arr, m):
@@ -36,12 +33,68 @@ def partition_list(arr, m):
     return [arr[i:i + n] for i in range(0, len(arr), n)]
 
 
-def preprocess(im_path, transforms):
+def save_result(alpha, im_path, trimap=None, fg_estimate=True, fg=None):
+    """
+    Save alpha and rgba.
+
+    Args:
+        alpha (numpy.ndarray): The value of alpha should in [0, 255], shape should be [h,w].
+        path (str): The save path
+        im_path (str): The original image path.
+        trimap (str, optional): The trimap if provided. Default: None.
+        fg_estimate (bool, optional): Whether to estimate the foreground, Default: True.
+        fg (numpy.ndarray, optional): The foreground, if provided, fg_estimate is invalid. Default: None.
+    """
+
+    # save alpha matte
+    if trimap is not None:
+        trimap = cv2.imread(trimap, 0)
+        alpha[trimap == 0] = 0
+        alpha[trimap == 255] = 255
+    alpha = (alpha).astype('uint8')
+
+    # save rgba
+    if isinstance(im_path, str):
+        im = cv2.imread(im_path)
+    else:
+        im = im_path
+    foreground, bbbg = estimate_foreground_ml(im / 255.0, alpha / 255.0, return_background=True)
+    fg = foreground * 255
+    fg = fg.astype('uint8')
+    alpha = alpha[:, :, np.newaxis]
+    rgba = np.concatenate((fg, alpha), axis=-1)
+
+    return rgba, bbbg
+
+
+def reverse_transform(img, trans_info):
+    """recover pred to origin shape"""
+    for item in trans_info[::-1]:
+        if item[0] == 'resize':
+            h, w = item[1][0], item[1][1]
+            img = F.interpolate(img, [h, w], mode='bilinear')
+        elif item[0] == 'padding':
+            h, w = item[1][0], item[1][1]
+            img = img[:, :, 0:h, 0:w]
+        else:
+            raise Exception("Unexpected info '{}' in im_info".format(item[0]))
+    return img
+
+
+def preprocess(img, transforms, trimap=None):
     data = {}
-    data['img'] = im_path
+    data['img'] = img
+    if trimap is not None:
+        data['trimap'] = trimap
+        data['gt_fields'] = ['trimap']
+    data['trans_info'] = []
     data = transforms(data)
-    data['img'] = data['img'][np.newaxis, ...]
     data['img'] = paddle.to_tensor(data['img'])
+    data['img'] = data['img'].unsqueeze(0)
+    if trimap is not None:
+        data['trimap'] = paddle.to_tensor(data['trimap'])
+        data['trimap'] = data['trimap'].unsqueeze((0, 1))
+
     return data
 
 
@@ -50,36 +103,21 @@ def predict(model,
             transforms,
             image_list,
             image_dir=None,
+            trimap_list=None,
             save_dir='output',
-            aug_pred=False,
-            scales=1.0,
-            flip_horizontal=True,
-            flip_vertical=False,
-            is_slide=False,
-            stride=None,
-            crop_size=None,
-            custom_color=None):
+            is_save=False,
+            fg_estimate=True):
     """
     predict and visualize the image_list.
 
     Args:
         model (nn.Layer): Used to predict for input image.
         model_path (str): The path of pretrained model.
-        transforms (transform.Compose): Preprocess for input image.
+        transforms (transforms.Compose): Preprocess for input image.
         image_list (list): A list of image path to be predicted.
         image_dir (str, optional): The root directory of the images predicted. Default: None.
+        trimap_list (list, optional): A list of trimap of image_list. Default: None.
         save_dir (str, optional): The directory to save the visualized results. Default: 'output'.
-        aug_pred (bool, optional): Whether to use mulit-scales and flip augment for predition. Default: False.
-        scales (list|float, optional): Scales for augment. It is valid when `aug_pred` is True. Default: 1.0.
-        flip_horizontal (bool, optional): Whether to use flip horizontally augment. It is valid when `aug_pred` is True. Default: True.
-        flip_vertical (bool, optional): Whether to use flip vertically augment. It is valid when `aug_pred` is True. Default: False.
-        is_slide (bool, optional): Whether to predict by sliding window. Default: False.
-        stride (tuple|list, optional): The stride of sliding window, the first is width and the second is height.
-            It should be provided when `is_slide` is True.
-        crop_size (tuple|list, optional):  The crop size of sliding window, the first is width and the second is height.
-            It should be provided when `is_slide` is True.
-        custom_color (list, optional): Save images with a custom color map. Default: None, use paddleseg's default color map.
-
     """
     utils.utils.load_entire_model(model, model_path)
     model.eval()
@@ -87,64 +125,77 @@ def predict(model,
     local_rank = paddle.distributed.get_rank()
     if nranks > 1:
         img_lists = partition_list(image_list, nranks)
+        trimap_lists = partition_list(
+            trimap_list, nranks) if trimap_list is not None else None
     else:
         img_lists = [image_list]
-
-    added_saved_dir = os.path.join(save_dir, 'added_prediction')
-    pred_saved_dir = os.path.join(save_dir, 'pseudo_color_prediction')
+        trimap_lists = [trimap_list] if trimap_list is not None else None
 
     logger.info("Start to predict...")
     progbar_pred = progbar.Progbar(target=len(img_lists[0]), verbose=1)
-    color_map = visualize.get_color_map_list(256, custom_color=custom_color)
+    preprocess_cost_averager = TimeAverager()
+    infer_cost_averager = TimeAverager()
+    postprocess_cost_averager = TimeAverager()
+    batch_start = time.time()
     with paddle.no_grad():
         for i, im_path in enumerate(img_lists[local_rank]):
-            data = preprocess(im_path, transforms)
+            preprocess_start = time.time()
+            trimap = trimap_lists[local_rank][
+                i] if trimap_list is not None else None
+            data = preprocess(img=im_path, transforms=transforms, trimap=trimap)
+            preprocess_cost_averager.record(time.time() - preprocess_start)
 
-            if aug_pred:
-                pred, _ = infer.aug_inference(
-                    model,
-                    data['img'],
-                    trans_info=data['trans_info'],
-                    scales=scales,
-                    flip_horizontal=flip_horizontal,
-                    flip_vertical=flip_vertical,
-                    is_slide=is_slide,
-                    stride=stride,
-                    crop_size=crop_size)
+            infer_start = time.time()
+            result = model(data)
+            infer_cost_averager.record(time.time() - infer_start)
+
+            postprocess_start = time.time()
+            if isinstance(result, paddle.Tensor):
+                alpha = result
+                fg = None
             else:
-                pred, _ = infer.inference(
-                    model,
-                    data['img'],
-                    trans_info=data['trans_info'],
-                    is_slide=is_slide,
-                    stride=stride,
-                    crop_size=crop_size)
-            pred = paddle.squeeze(pred)
-            pred = pred.numpy().astype('uint8')
+                alpha = result['alpha']
+                fg = result.get('fg', None)
+
+            alpha = reverse_transform(alpha, data['trans_info'])
+            alpha = (alpha.numpy()).squeeze()
+            alpha = (alpha * 255).astype('uint8')
+            if fg is not None:
+                fg = reverse_transform(fg, data['trans_info'])
+                fg = (fg.numpy()).squeeze().transpose((1, 2, 0))
+                fg = (fg * 255).astype('uint8')
 
             # get the saved name
             if image_dir is not None:
                 im_file = im_path.replace(image_dir, '')
             else:
-                im_file = os.path.basename(im_path)
+                im_file = im_path
             if im_file[0] == '/' or im_file[0] == '\\':
                 im_file = im_file[1:]
 
-            # save added image
-            added_image = utils.visualize.visualize(
-                im_path, pred, color_map, weight=0.6)
-            added_image_path = os.path.join(added_saved_dir, im_file)
-            mkdir(added_image_path)
-            cv2.imwrite(added_image_path, added_image)
+            fg, bbbg = save_result(
+                alpha,
+                im_path=im_path,
+                trimap=trimap,
+                fg_estimate=fg_estimate,
+                fg=fg)
 
-            # save pseudo color prediction
-            pred_mask = utils.visualize.get_pseudo_color_map(pred, color_map)
-            pred_saved_path = os.path.join(
-                pred_saved_dir, os.path.splitext(im_file)[0] + ".png")
-            mkdir(pred_saved_path)
-            pred_mask.save(pred_saved_path)
+            # rvm have member which need to reset.
+            if hasattr(model, 'reset'):
+                model.reset()
 
-            progbar_pred.update(i + 1)
+            postprocess_cost_averager.record(time.time() - postprocess_start)
 
-    logger.info("Predicted images are saved in {} and {} .".format(
-        added_saved_dir, pred_saved_dir))
+            preprocess_cost = preprocess_cost_averager.get_average()
+            infer_cost = infer_cost_averager.get_average()
+            postprocess_cost = postprocess_cost_averager.get_average()
+            if local_rank == 0:
+                progbar_pred.update(i + 1,
+                                    [('preprocess_cost', preprocess_cost),
+                                     ('infer_cost cost', infer_cost),
+                                     ('postprocess_cost', postprocess_cost)])
+
+            preprocess_cost_averager.reset()
+            infer_cost_averager.reset()
+            postprocess_cost_averager.reset()
+    return alpha, fg, bbbg

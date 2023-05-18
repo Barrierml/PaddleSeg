@@ -16,16 +16,28 @@ import argparse
 import os
 import sys
 
-import paddle
 import paddleseg
 from paddleseg.cvlibs import manager
 from paddleseg.utils import get_sys_env, logger
+from functools import lru_cache
+
+# 设置环境变量
+CUDA_VISIBLE_DEVICES=0
+os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 
 LOCAL_PATH = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.join(LOCAL_PATH, '..'))
 
 manager.BACKBONES._components_dict.clear()
 manager.TRANSFORMS._components_dict.clear()
+
+class Dict(dict):
+
+    def __getattr__(self, key):
+        return self.get(key)
+
+    def __setattr__(self, key, value):
+        self[key] = value
 
 import ppmatting
 from ppmatting.core import predict
@@ -77,38 +89,49 @@ def parse_args():
 
     return parser.parse_args()
 
-
-def main(args):
-    assert args.cfg is not None, \
-        'No configuration file specified, please set --config'
-    cfg = Config(args.cfg)
+@lru_cache
+def get_model(cfg, device='gpu'):
+    cfg = Config(cfg)
     builder = MatBuilder(cfg)
 
     paddleseg.utils.show_env_info()
     paddleseg.utils.show_cfg_info(cfg)
-    paddleseg.utils.set_device(args.device)
+    paddleseg.utils.set_device(device)
 
     model = builder.model
     transforms = ppmatting.transforms.Compose(builder.val_transforms)
+    return model, transforms
 
-    image_list, image_dir = get_image_list(args.image_path)
-    if args.trimap_path is None:
-        trimap_list = None
-    else:
-        trimap_list, _ = get_image_list(args.trimap_path)
+
+
+
+def humanSegment(args):
+    default_args = {
+        'config': '/root/PaddleSeg/Matting/configs/ppmatting/ppmatting-hrnet_w18-human_512.yml',
+        'model_path': '/root/PaddleSeg/Matting/ppmatting-hrnet_w18-human_512.pdparams',
+        'cfg': '/root/PaddleSeg/Matting/configs/ppmatting/ppmatting-hrnet_w18-human_512.yml',
+        'device': 'gpu',
+    }
+    # 合并dict对象
+    args = Dict({**default_args, **args})
+
+    model, transforms = get_model(args.cfg, args.device)
+
+    image_list = args.image_list
     logger.info('Number of predict images = {}'.format(len(image_list)))
 
-    predict(
+    return predict(
         model,
         model_path=args.model_path,
         transforms=transforms,
         image_list=image_list,
-        image_dir=image_dir,
-        trimap_list=trimap_list,
+        image_dir=None,
+        trimap_list=None,
         save_dir=args.save_dir,
         fg_estimate=args.fg_estimate)
 
 
 if __name__ == '__main__':
     args = parse_args()
-    main(args)
+    # 合并参数
+    humanSegment(args)
